@@ -29,7 +29,18 @@ PROWLARR_URL = os.getenv("PROWLARR_URL", "http://192.168.1.10:9696").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY")
 
 crypto = WeChatCrypto(APP_TOKEN, ENCODING_AES_KEY, CORP_ID)
-recent_msg_ids = []
+
+# --- 内存缓存区 ---
+recent_msg_ids = []         # 防重复消息缓存
+user_search_cache = {}      # 保存用户的搜索结果列表 { "user_id": [ {title, size, url}, ... ] }
+
+def format_size(size_bytes):
+    """将字节大小格式化为 MB 或 GB"""
+    if not size_bytes: return "未知大小"
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb >= 1024:
+        return f"{size_mb/1024:.2f} GB"
+    return f"{size_mb:.2f} MB"
 
 def send_wechat_reply(touser, content):
     try:
@@ -49,11 +60,9 @@ def send_wechat_reply(touser, content):
     except Exception as e:
         print(f"[*] 微信回复失败: {e}")
 
-def search_magnet(keyword):
-    """通过本地的 Prowlarr API 聚合搜索磁力/种子链接"""
-    if not PROWLARR_API_KEY:
-        print("[*] 未配置 PROWLARR_API_KEY")
-        return None
+def get_search_results(keyword):
+    """搜索并返回资源列表（包含标题、大小、链接等）"""
+    if not PROWLARR_API_KEY: return []
         
     try:
         url = f"{PROWLARR_URL}/api/v1/search"
@@ -66,22 +75,16 @@ def search_magnet(keyword):
         
         valid_results = []
         for item in results:
-            # 尝试获取不同的下载来源
             info_hash = item.get("infoHash")
             magnet = item.get("magnetUrl")
             dl_url = item.get("downloadUrl")
             
             final_url = None
-            
-            # 1. 优先：如果有 infoHash 特征码，直接完美拼装出磁力链 (CD2最喜欢这种)
             if info_hash:
                 final_url = f"magnet:?xt=urn:btih:{info_hash}"
-            # 2. 其次：如果本身就是直接的磁力链
             elif magnet and magnet.startswith("magnet:"):
                 final_url = magnet
-            # 3. 最后：如果只有 torrent 下载链接
             elif dl_url:
-                # 给代理下载链接拼接上 api_key，防止 CD2 下载种子时被 Prowlarr 拦截
                 if PROWLARR_URL in dl_url and "apikey=" not in dl_url.lower():
                     sep = "&" if "?" in dl_url else "?"
                     final_url = f"{dl_url}{sep}apikey={PROWLARR_API_KEY}"
@@ -92,25 +95,21 @@ def search_magnet(keyword):
                 
             if final_url:
                 valid_results.append({
-                    "url": final_url,
+                    "title": item.get("title", "未知标题"),
+                    "size": item.get("size", 0),
                     "seeders": item.get("seeders", 0),
-                    "indexer": item.get("indexer", "未知站")
+                    "indexer": item.get("indexer", "未知"),
+                    "url": final_url
                 })
         
-        if valid_results:
-            # 按照做种人数倒序，选下载最快的
-            valid_results.sort(key=lambda x: x["seeders"], reverse=True)
-            best_choice = valid_results[0]
-            print(f"[*] 找到资源，来自: {best_choice['indexer']}，做种数: {best_choice['seeders']}")
-            return best_choice["url"]
-            
-        return None
+        # 按做种人数排序，最多返回 8 个结果防止微信消息超长
+        valid_results.sort(key=lambda x: x["seeders"], reverse=True)
+        return valid_results[:8]
     except Exception as e:
         print(f"[*] Prowlarr 搜索异常: {e}")
-        return None
+        return []
 
 def cd2_offline_download(target_url):
-    """使用 gRPC 调用 CloudDrive2 添加离线下载"""
     if not CD2_TOKEN: return False, "未配置 CD2_TOKEN"
     try:
         channel = grpc.insecure_channel(CD2_HOST)
@@ -123,45 +122,63 @@ def cd2_offline_download(target_url):
         )
         res = stub.AddOfflineFiles(req, metadata=metadata, timeout=10)
         return (True, "提交成功") if res.success else (False, f"被拒: {res.errorMessage}")
-    except grpc.RpcError as e:
-        return False, f"gRPC错误: {e.code().name}"
     except Exception as e:
         return False, f"系统异常: {str(e)}"
 
 def process_message_async(from_user, content):
-    """后台异步处理线程"""
-    target_url = None
-    is_search = False
-    
+    # 【模式1】用户发送纯数字序号进行选择下载
+    if content.isdigit():
+        if from_user in user_search_cache:
+            idx = int(content) - 1
+            cached_results = user_search_cache[from_user]
+            
+            if 0 <= idx < len(cached_results):
+                selected_item = cached_results[idx]
+                target_url = selected_item["url"]
+                
+                send_wechat_reply(from_user, f"⏳ 正在推送: {selected_item['title'][:30]}...")
+                success, detail = cd2_offline_download(target_url)
+                
+                if success:
+                    send_wechat_reply(from_user, f"✅ 离线任务建立成功！\n🤖 状态: {detail}")
+                else:
+                    send_wechat_reply(from_user, f"❌ 离线任务失败\n⚠️ 原因: {detail}")
+            else:
+                send_wechat_reply(from_user, "⚠️ 无效的序号，请回复列表中存在的数字。")
+        else:
+            send_wechat_reply(from_user, "⚠️ 未找到你的搜索记录，请先输入番号进行搜索。")
+        return
+
+    # 【模式2】用户直接发送磁力/种子链接
     if content.startswith("magnet:?") or content.startswith("http"):
-        target_url = content
-    elif len(content) > 3: 
-        send_wechat_reply(from_user, f"🔍 正在本地索引库搜索【{content}】...")
-        is_search = True
-        target_url = search_magnet(content)
-    
-    if target_url:
-        success, detail = cd2_offline_download(target_url)
-        
-        # 提取展示文字
-        hash_code = "未知资源格式"
-        if "urn:btih:" in target_url:
-            hash_code = target_url.split("urn:btih:")[1][:10].upper() + "..."
-        elif target_url.startswith("http"):
-            hash_code = "Torrent 种子文件"
-            
+        success, detail = cd2_offline_download(content)
         if success:
-            prefix = "✅ 本地检索并离线成功" if is_search else "✅ 离线任务已建立"
-            reply_text = f"{prefix}\n🧲 {hash_code}\n🤖 状态: {detail}"
+            send_wechat_reply(from_user, f"✅ 直链离线成功\n🤖 状态: {detail}")
         else:
-            reply_text = f"❌ 离线任务失败\n⚠️ 原因: {detail}"
+            send_wechat_reply(from_user, f"❌ 直链离线失败\n⚠️ 原因: {detail}")
+        return
+
+    # 【模式3】用户发送关键词进行搜索
+    if len(content) > 3: 
+        send_wechat_reply(from_user, f"🔍 正在检索【{content}】...")
+        results = get_search_results(content)
+        
+        if results:
+            # 将搜索结果存入该用户的“短期记忆”中
+            user_search_cache[from_user] = results
             
-        send_wechat_reply(from_user, reply_text)
-    else:
-        if is_search:
-            send_wechat_reply(from_user, f"😭 抱歉，本地索引库未能找到【{content}】。建议在 Prowlarr 添加更多 Indexer。")
+            # 拼接回复文案
+            reply_lines = [f"🔍 找到 {len(results)} 个结果，请直接回复【序号】下载：\n"]
+            for i, res in enumerate(results):
+                size_str = format_size(res['size'])
+                # 截取标题长度防止过长
+                title_short = res['title'][:40] + ("..." if len(res['title']) > 40 else "")
+                reply_lines.append(f"{i+1}. [{size_str}] {title_short} (源:{res['indexer']} 种:{res['seeders']})")
+                
+            # 一次性发送列表给用户
+            send_wechat_reply(from_user, "\n".join(reply_lines))
         else:
-            send_wechat_reply(from_user, "💡 请发送合法的磁力链接或番号关键词。")
+            send_wechat_reply(from_user, f"😭 未能在库中找到【{content}】。")
 
 @app.route('/wechat', methods=['GET', 'POST'])
 def wechat_callback():
@@ -199,7 +216,6 @@ def wechat_callback():
                 
             return "success"
         except Exception as e:
-            print(f"[*] 处理异常: {e}")
             return "success"
 
 if __name__ == '__main__':
