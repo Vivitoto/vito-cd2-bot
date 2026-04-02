@@ -1,4 +1,3 @@
-markdown
 # 🤖 企业微信 CD2 离线下载机器人 (WeChat CD2 Bot)
 
 基于 Python + Flask + gRPC 构建的企业微信机器人。将你的企业微信打造成一个**全自动找资源 + 离线下载的超级中枢**！发送车牌号，一键检索并推送到本地的 CloudDrive2 进行离线下载。
@@ -37,21 +36,16 @@ version: '3.8'
 
 services:
   qywx-cd2-bot:
-    image: ghcr.io/你的GitHub用户名/qywx-cd2-bot:latest
+    image: ghcr.io/jiumian8/qywx-cd2-bot:latest
     container_name: qywx-cd2-bot
     restart: unless-stopped
     ports:
-      - "5000:5000"  # 左侧可以改为你想要暴露的外部端口
-    environment:
-      # ==============================
-      # ⚠️ 警告：所有的值后面千万不要加多余的空格！
-      # ⚠️ 警告：所有的值都【不要】使用引号（"" 或 ''）包裹！
-      # ==============================
-      
+      - "5110:5000"  # 左侧可以改为你想要暴露的外部端口
+    environment:   
       # --- 企业微信凭证 ---
-      - CORP_ID=ww1234abcd5678efgh
+      - CORP_ID=企业ID
       - APP_SECRET=你的自建应用Secret
-      - AGENT_ID=1000001
+      - AGENT_ID=应用id
       - APP_TOKEN=你的接收消息Token
       - ENCODING_AES_KEY=你的43位消息加解密Key
       
@@ -64,7 +58,7 @@ services:
       - DOWNLOAD_PATH=/115/离线下载目录   # CD2中真实存在的挂载路径
       
       # --- Prowlarr 聚合搜索配置 ---
-      - PROWLARR_URL=[http://192.168.](http://192.168.)x.x:9696  # Prowlarr的内网地址，必须带 http://
+      - PROWLARR_URL=http://192.168.x.x:9696  # Prowlarr的内网地址，必须带 http://
       - PROWLARR_API_KEY=你的Prowlarr_API_Key
 ```
 ### 2. 配置企业微信回调
