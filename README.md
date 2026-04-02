@@ -1,6 +1,4 @@
-没问题，这是按照你的要求精简后的最终版 Markdown 文档。你可以直接点击右上角的“复制”按钮一键复制：
-
-```markdown
+markdown
 # 🤖 企业微信 CD2 离线下载机器人 (WeChat CD2 Bot)
 
 基于 Python + Flask + gRPC 构建的企业微信机器人。将你的企业微信打造成一个**全自动找资源 + 离线下载的超级中枢**！发送车牌号，一键检索并推送到本地的 CloudDrive2 进行离线下载。
@@ -68,7 +66,6 @@ services:
       # --- Prowlarr 聚合搜索配置 ---
       - PROWLARR_URL=[http://192.168.](http://192.168.)x.x:9696  # Prowlarr的内网地址，必须带 http://
       - PROWLARR_API_KEY=你的Prowlarr_API_Key
-```
 
 ### 2. 配置企业微信回调
 
