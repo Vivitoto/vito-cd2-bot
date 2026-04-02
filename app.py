@@ -29,12 +29,9 @@ PROWLARR_URL = os.getenv("PROWLARR_URL", "http://192.168.1.10:9696").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY")
 
 crypto = WeChatCrypto(APP_TOKEN, ENCODING_AES_KEY, CORP_ID)
-
-# 消息防重放缓存
 recent_msg_ids = []
 
 def send_wechat_reply(touser, content):
-    """通过微信代理发回信"""
     try:
         token_url = f"{WECHAT_PROXY}/cgi-bin/gettoken?corpid={CORP_ID}&corpsecret={APP_SECRET}"
         token_res = requests.get(token_url, timeout=10).json()
@@ -53,7 +50,7 @@ def send_wechat_reply(touser, content):
         print(f"[*] 微信回复失败: {e}")
 
 def search_magnet(keyword):
-    """通过本地的 Prowlarr API 聚合搜索磁力链接"""
+    """通过本地的 Prowlarr API 聚合搜索磁力/种子链接"""
     if not PROWLARR_API_KEY:
         print("[*] 未配置 PROWLARR_API_KEY")
         return None
@@ -69,29 +66,50 @@ def search_magnet(keyword):
         
         valid_results = []
         for item in results:
-            magnet = item.get("magnetUrl") or item.get("downloadUrl")
-            if not magnet and str(item.get("guid")).startswith("magnet:"):
-                magnet = item.get("guid")
+            # 尝试获取不同的下载来源
+            info_hash = item.get("infoHash")
+            magnet = item.get("magnetUrl")
+            dl_url = item.get("downloadUrl")
+            
+            final_url = None
+            
+            # 1. 优先：如果有 infoHash 特征码，直接完美拼装出磁力链 (CD2最喜欢这种)
+            if info_hash:
+                final_url = f"magnet:?xt=urn:btih:{info_hash}"
+            # 2. 其次：如果本身就是直接的磁力链
+            elif magnet and magnet.startswith("magnet:"):
+                final_url = magnet
+            # 3. 最后：如果只有 torrent 下载链接
+            elif dl_url:
+                # 给代理下载链接拼接上 api_key，防止 CD2 下载种子时被 Prowlarr 拦截
+                if PROWLARR_URL in dl_url and "apikey=" not in dl_url.lower():
+                    sep = "&" if "?" in dl_url else "?"
+                    final_url = f"{dl_url}{sep}apikey={PROWLARR_API_KEY}"
+                else:
+                    final_url = dl_url
+            elif str(item.get("guid")).startswith("magnet:"):
+                final_url = item.get("guid")
                 
-            if magnet and magnet.startswith("magnet:"):
+            if final_url:
                 valid_results.append({
-                    "magnet": magnet,
+                    "url": final_url,
                     "seeders": item.get("seeders", 0),
                     "indexer": item.get("indexer", "未知站")
                 })
         
         if valid_results:
+            # 按照做种人数倒序，选下载最快的
             valid_results.sort(key=lambda x: x["seeders"], reverse=True)
             best_choice = valid_results[0]
             print(f"[*] 找到资源，来自: {best_choice['indexer']}，做种数: {best_choice['seeders']}")
-            return best_choice["magnet"]
+            return best_choice["url"]
             
         return None
     except Exception as e:
         print(f"[*] Prowlarr 搜索异常: {e}")
         return None
 
-def cd2_offline_download(magnet_url):
+def cd2_offline_download(target_url):
     """使用 gRPC 调用 CloudDrive2 添加离线下载"""
     if not CD2_TOKEN: return False, "未配置 CD2_TOKEN"
     try:
@@ -99,7 +117,7 @@ def cd2_offline_download(magnet_url):
         stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
         req = clouddrive_pb2.AddOfflineFileRequest(
-            urls=magnet_url,
+            urls=target_url,
             toFolder=DOWNLOAD_PATH,
             checkFolderAfterSecs=0
         )
@@ -112,20 +130,26 @@ def cd2_offline_download(magnet_url):
 
 def process_message_async(from_user, content):
     """后台异步处理线程"""
-    target_magnet = None
+    target_url = None
     is_search = False
     
-    if content.startswith("magnet:?"):
-        target_magnet = content
+    if content.startswith("magnet:?") or content.startswith("http"):
+        target_url = content
     elif len(content) > 3: 
         send_wechat_reply(from_user, f"🔍 正在本地索引库搜索【{content}】...")
         is_search = True
-        target_magnet = search_magnet(content)
+        target_url = search_magnet(content)
     
-    if target_magnet:
-        success, detail = cd2_offline_download(target_magnet)
-        hash_code = target_magnet.split("urn:btih:")[1][:10].upper() + "..." if "urn:btih:" in target_magnet else "未知特征码"
+    if target_url:
+        success, detail = cd2_offline_download(target_url)
         
+        # 提取展示文字
+        hash_code = "未知资源格式"
+        if "urn:btih:" in target_url:
+            hash_code = target_url.split("urn:btih:")[1][:10].upper() + "..."
+        elif target_url.startswith("http"):
+            hash_code = "Torrent 种子文件"
+            
         if success:
             prefix = "✅ 本地检索并离线成功" if is_search else "✅ 离线任务已建立"
             reply_text = f"{prefix}\n🧲 {hash_code}\n🤖 状态: {detail}"
@@ -157,7 +181,6 @@ def wechat_callback():
             msg_xml = crypto.decrypt_message(request.data, signature, timestamp, nonce)
             tree = ET.fromstring(msg_xml)
             
-            # --- 消息防重复逻辑 ---
             msg_id_node = tree.find('MsgId')
             if msg_id_node is not None:
                 msg_id = msg_id_node.text
@@ -172,7 +195,6 @@ def wechat_callback():
             
             if msg_type == 'text':
                 content = tree.find('Content').text.strip()
-                # 开启新线程去处理业务，主线程秒回微信防止重复提醒
                 threading.Thread(target=process_message_async, args=(from_user, content)).start()
                 
             return "success"
