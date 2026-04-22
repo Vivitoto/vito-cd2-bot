@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import xml.etree.ElementTree as ET
+from datetime import datetime
 import requests
 from flask import Flask, request
 from wechatpy.enterprise.crypto import WeChatCrypto
@@ -23,6 +24,7 @@ WECHAT_PROXY = os.getenv("WECHAT_PROXY", "https://qyapi.weixin.qq.com").rstrip("
 CD2_HOST = os.getenv("CD2_HOST", "192.168.1.10:19798").replace("http://", "").replace("https://", "")
 CD2_TOKEN = os.getenv("CD2_TOKEN")
 DOWNLOAD_PATH = os.getenv("DOWNLOAD_PATH")
+ORGANIZE_BY_DATE = os.getenv("ORGANIZE_BY_DATE", "true").lower() in ("true", "1", "yes", "on")
 
 # --- 3. Prowlarr 聚合搜索配置 ---
 PROWLARR_URL = os.getenv("PROWLARR_URL", "http://192.168.1.10:9696").rstrip("/")
@@ -109,19 +111,58 @@ def get_search_results(keyword):
         print(f"[*] Prowlarr 搜索异常: {e}")
         return []
 
-def cd2_offline_download(target_url):
-    if not CD2_TOKEN: return False, "未配置 CD2_TOKEN"
+def _get_today_folder():
+    """根据配置返回实际转存目录。若 ORGANIZE_BY_DATE 开启，则在 DOWNLOAD_PATH 下追加 YYYY-MM-DD 目录。"""
+    base = DOWNLOAD_PATH or "/"
+    if not ORGANIZE_BY_DATE:
+        return base
+    today = datetime.now().strftime("%Y-%m-%d")
+    # 统一使用 / 作为路径分隔符，去掉尾部多余 /
+    base = base.rstrip("/")
+    return f"{base}/{today}"
+
+def _cd2_create_folder(folder_path):
+    """通过 CD2 gRPC 创建目录；若目录已存在则忽略错误。"""
+    if not CD2_TOKEN:
+        return False
     try:
         channel = grpc.insecure_channel(CD2_HOST)
         stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
-        metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
+        metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
+        req = clouddrive_pb2.CreateFolderRequest(path=folder_path)
+        stub.CreateFolder(req, metadata=metadata, timeout=10)
+        return True
+    except grpc.RpcError as e:
+        # 目录已存在时通常会返回 ALREADY_EXISTS，属于正常情况
+        if e.code() == grpc.StatusCode.ALREADY_EXISTS:
+            return True
+        print(f"[*] CD2 创建目录异常: {e}")
+        return False
+    except Exception as e:
+        print(f"[*] CD2 创建目录异常: {e}")
+        return False
+
+def cd2_offline_download(target_url):
+    if not CD2_TOKEN: return False, "未配置 CD2_TOKEN"
+    try:
+        target_folder = _get_today_folder()
+        
+        # 若开启了按日期归档，先尝试创建日期目录
+        if ORGANIZE_BY_DATE:
+            created = _cd2_create_folder(target_folder)
+            if not created:
+                print(f"[*] 警告：创建日期目录 {target_folder} 失败，将尝试直接转存到该路径")
+        
+        channel = grpc.insecure_channel(CD2_HOST)
+        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+        metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.AddOfflineFileRequest(
             urls=target_url,
-            toFolder=DOWNLOAD_PATH,
+            toFolder=target_folder,
             checkFolderAfterSecs=0
         )
         res = stub.AddOfflineFiles(req, metadata=metadata, timeout=10)
-        return (True, "提交成功") if res.success else (False, f"被拒: {res.errorMessage}")
+        return (True, f"提交成功 → {target_folder}") if res.success else (False, f"被拒: {res.errorMessage}")
     except Exception as e:
         return False, f"系统异常: {str(e)}"
 
