@@ -45,7 +45,8 @@ services:
       - TZ=Asia/Shanghai
     ports:
       - 9696:9696
-    restart: unless-stopped```
+    restart: unless-stopped
+```
 运行 docker compose up -d 启动。
 
 2. 初始化教程
