@@ -26,6 +26,41 @@
 ## 🚀 部署指南 (Deployment)
 
 推荐使用 Docker Compose 进行部署。
+🛠️ 第一部分：Prowlarr 部署与配置 (聚合搜索中心)
+Prowlarr 是本系统的“眼睛”，负责从全球各大索引站抓取资源。
+
+1. Docker 部署
+在你的 PVE 或 NAS 上创建 prowlarr 目录，新建 docker-compose.yml：
+
+YAML
+version: '3'
+services:
+  prowlarr:
+    image: ghcr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=Asia/Shanghai
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+运行 docker compose up -d 启动。
+
+2. 初始化教程
+访问后台： 浏览器打开 http://你的IP:9696。
+
+添加索引器 (Indexer)：
+
+点击左侧 Indexers -> Add Indexer。
+
+搜索并添加 Sukebei (找车牌神器) 和 Solid Torrents (通用搜索)。
+
+点击 Save 保存。
+
+获取 API Key：
+
+前往 Settings -> General -> 复制 API Key（稍后填入机器人配置）。
 
 ### 1. 创建 `docker-compose.yml`
 
