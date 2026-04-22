@@ -41,5 +41,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/vivitoto/vito-cd2-bot:latest
-            vivitoto/vito-cd2-bot:1.0.0
+            vivitoto/vito-cd2-bot:1.0.1
             vivitoto/vito-cd2-bot:latest
