@@ -3,7 +3,8 @@ default_route: main
 # 全局中转清洗目录（所有路由共用）
 # 配置了则磁力链接先下载到这里，完成后自动清洗并转存到目标目录
 # 留空或删除则磁力链接直接提交到目标目录，ed2k 始终直接提交
-staging_folder: /115open/staging
+# 示例：staging_folder: /115open/staging
+staging_folder:
 
 routes:
   # ----------------------------------------------------------

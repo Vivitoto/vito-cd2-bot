@@ -431,6 +431,49 @@ def _cd2_delete_file(path: str):
         return False
 
 
+def _process_staging_directory(dir_path: str, target_folder: str, ext_blacklist: set, threshold: Optional[float], junk_list: list):
+    """递归处理中转目录下的子目录：列出文件、清洗垃圾、保留结构。
+    返回 (保留条目数, 垃圾文件数)。"""
+    import time
+    entries = _cd2_list_directory_files(dir_path)
+    if not entries:
+        return 0, 0
+
+    keep_count = 0
+    junk_count = 0
+
+    for entry in entries:
+        if entry.fileType == clouddrive_pb2.CloudDriveFile.File:
+            ext = entry.name.rsplit(".", 1)[-1].lower() if "." in entry.name else ""
+            size_mb = entry.size / (1024 * 1024) if entry.size else 0
+            is_junk = False
+            reason = ""
+            if ext in ext_blacklist:
+                if threshold is not None:
+                    if size_mb < threshold:
+                        is_junk = True
+                        reason = f"{entry.name} ({ext}, {size_mb:.1f}MB < {threshold}MB)"
+                else:
+                    is_junk = True
+                    reason = f"{entry.name} ({ext})"
+            if is_junk:
+                if _cd2_delete_file(entry.fullPathName):
+                    junk_list.append(reason)
+                    junk_count += 1
+                time.sleep(5)
+            else:
+                keep_count += 1
+        elif entry.fileType == clouddrive_pb2.CloudDriveFile.Directory:
+            # 递归处理子目录
+            sub_keep, sub_junk = _process_staging_directory(
+                entry.fullPathName, target_folder, ext_blacklist, threshold, junk_list
+            )
+            keep_count += sub_keep
+            junk_count += sub_junk
+
+    return keep_count, junk_count
+
+
 def _process_staging_task(task: dict):
     """处理单个中转任务：下载完成后清洗并转存。"""
     import time
@@ -440,70 +483,71 @@ def _process_staging_task(task: dict):
 
     log_info(f"开始处理中转任务: {staging_path}")
 
-    # 1. 列出中转目录的实际文件
-    files = _cd2_list_directory_files(staging_path)
-    if not files:
+    # 列出中转目录下的所有条目
+    entries = _cd2_list_directory_files(staging_path)
+    if not entries:
         log_info(f"中转目录为空: {staging_path}")
         send_wechat_reply(user_id, f"📦 中转任务完成\n目标目录: {target_folder}\n⚠️ 目录为空，无文件可处理。")
         return
 
-    keep_files = []
-    junk_files = []
-
     ext_blacklist = _get_junk_extensions()
     threshold = _get_size_threshold_mb()
+    junk_list = []  # 收集所有垃圾文件原因
 
-    for f in files:
-        # 跳过子目录
-        if f.fileType == clouddrive_pb2.CloudDriveFile.Directory:
-            continue
+    moved_items = 0
+    deleted_items = 0
 
-        ext = ""
-        if "." in f.name:
-            ext = f.name.rsplit(".", 1)[-1].lower()
-
-        size_mb = f.size / (1024 * 1024) if f.size else 0
-        is_junk = False
-        reason = ""
-
-        if ext in ext_blacklist:
-            if threshold is not None:
-                if size_mb < threshold:
+    for entry in entries:
+        if entry.fileType == clouddrive_pb2.CloudDriveFile.File:
+            # 根目录下的文件：判断清洗，保留的移到目标目录
+            ext = entry.name.rsplit(".", 1)[-1].lower() if "." in entry.name else ""
+            size_mb = entry.size / (1024 * 1024) if entry.size else 0
+            is_junk = False
+            reason = ""
+            if ext in ext_blacklist:
+                if threshold is not None:
+                    if size_mb < threshold:
+                        is_junk = True
+                        reason = f"{entry.name} ({ext}, {size_mb:.1f}MB < {threshold}MB)"
+                else:
                     is_junk = True
-                    reason = f"{f.name} ({ext}, {size_mb:.1f}MB < {threshold}MB)"
+                    reason = f"{entry.name} ({ext})"
+            if is_junk:
+                if _cd2_delete_file(entry.fullPathName):
+                    junk_list.append(reason)
+                    deleted_items += 1
+                time.sleep(5)
             else:
-                is_junk = True
-                reason = f"{f.name} ({ext})"
+                if _cd2_move_file(entry.fullPathName, target_folder):
+                    moved_items += 1
+                time.sleep(5)
 
-        if is_junk:
-            junk_files.append((f.fullPathName, reason))
-        else:
-            keep_files.append(f.fullPathName)
+        elif entry.fileType == clouddrive_pb2.CloudDriveFile.Directory:
+            # 子目录（如磁力链接下载的文件夹 aaa）
+            # 1. 递归清洗子目录里的垃圾文件
+            sub_keep, sub_junk = _process_staging_directory(
+                entry.fullPathName, target_folder, ext_blacklist, threshold, junk_list
+            )
+            deleted_items += sub_junk
 
-    # 2. 逐个移动保留文件（每 5 秒一个）
-    moved_count = 0
-    for src_path in keep_files:
-        if _cd2_move_file(src_path, target_folder):
-            moved_count += 1
-        time.sleep(5)
+            # 2. 移动整个子目录到目标目录（保持结构）
+            if _cd2_move_file(entry.fullPathName, target_folder):
+                moved_items += 1
+                log_info(f"子目录移动成功: {entry.fullPathName} -> {target_folder}")
+            else:
+                log_warn(f"子目录移动失败: {entry.fullPathName} -> {target_folder}")
+            time.sleep(5)
 
-    # 3. 逐个删除垃圾文件（每 5 秒一个）
-    deleted_count = 0
-    for src_path, reason in junk_files:
-        if _cd2_delete_file(src_path):
-            deleted_count += 1
-        time.sleep(5)
-
-    # 4. 通知用户（只做一次，在处理完所有文件之后）
-    log_info(f"中转清洗统计: 总文件 {len(files)} 个, 保留 {len(keep_files)} 个, 垃圾文件 {len(junk_files)} 个, 成功移动 {moved_count} 个, 成功删除 {deleted_count} 个")
+    # 通知用户
+    log_info(f"中转清洗统计: 总条目 {len(entries)} 个, 保留 {moved_items} 个, 垃圾文件 {deleted_items} 个")
 
     clean_info = ""
-    if junk_files and deleted_count > 0:
-        clean_info = f"\n🧹 已清洗垃圾文件: {deleted_count}/{len(junk_files)} 个\n" + "\n".join(f"  - {r}" for _, r in junk_files)
+    if junk_list and deleted_items > 0:
+        clean_info = f"\n🧹 已清洗垃圾文件: {deleted_items} 个\n" + "\n".join(f"  - {r}" for r in junk_list)
 
     send_wechat_reply(
         user_id,
-        f"✅ 中转任务完成\n📦 保留文件: {moved_count}/{len(keep_files)} 个\n🤖 目标目录: {target_folder}{clean_info}"
+        f"✅ 中转任务完成\n📦 保留条目: {moved_items} 个\n🤖 目标目录: {target_folder}{clean_info}"
     )
 
 
@@ -558,6 +602,38 @@ def _staging_cleanup_worker():
 
         except Exception as e:
             log_warn(f"中转监控线程异常: {e}")
+
+
+def _reply_staging_tasks(user_id: str):
+    """回复当前进行中（未完成）的中转任务列表给用户。"""
+    with staging_lock:
+        tasks = list(staging_tasks.items())
+
+    # 只保留 pending 和 processing 状态的任务
+    active_tasks = [
+        (task_id, task)
+        for task_id, task in tasks
+        if task.get("status") in ("pending", "processing")
+    ]
+
+    if not active_tasks:
+        send_wechat_reply(user_id, "📋 当前没有进行中转任务。")
+        return
+
+    status_map = {
+        "pending": "⏳ 正在离线下载",
+        "processing": "🧹 正在清理垃圾文件/转存中",
+    }
+
+    lines = ["📋 进行中转任务列表："]
+    for task_id, task in active_tasks:
+        status = task.get("status", "unknown")
+        submitted = task.get("submitted_at", "未知")
+        target = task.get("target_folder", "未知")
+        status_text = status_map.get(status, f"未知状态({status})")
+        lines.append(f"\n🆔 {task_id}\n🕐 {submitted}\n📍 {status_text}\n🎯 目标: {target}")
+
+    send_wechat_reply(user_id, "\n".join(lines))
 
 
 # --- 启动中转监控线程 ---
@@ -671,6 +747,11 @@ def _parse_download_command(content: str):
 def process_message_async(from_user, content):
     content = str(content or "").strip()
 
+    # 查询中转任务状态
+    if content.lower() in ("/tasks", "/status"):
+        _reply_staging_tasks(from_user)
+        return
+
     if content.startswith("/") and len(content.split()) == 1:
         route_name = content[1:].strip().lower()
         if _get_route_config(route_name):
@@ -728,29 +809,25 @@ def process_message_async(from_user, content):
         # magnet 走中转清洗（如果配置了 STAGING_FOLDER）
         staging_task_id = None
         if STAGING_FOLDER and magnet_urls:
-            import uuid
-            task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-            staging_path = _join_path(STAGING_FOLDER, task_id)
-            _cd2_ensure_folder_recursive(staging_path)
-
             mag_success = 0
             mag_fail = 0
             mag_fail_reasons = []
             for target_url in magnet_urls:
-                success, detail = cd2_offline_download(target_url, target_folder=staging_path)
+                success, detail = cd2_offline_download(target_url, target_folder=STAGING_FOLDER)
                 if success:
                     mag_success += 1
                 else:
                     mag_fail += 1
                     mag_fail_reasons.append(detail)
 
+            task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             with staging_lock:
                 staging_tasks[task_id] = {
                     "urls": magnet_urls,
                     "target_folder": target_folder,
                     "user_id": from_user,
                     "status": "pending",
-                    "staging_path": staging_path,
+                    "staging_path": STAGING_FOLDER,
                     "submitted_at": datetime.now().isoformat(),
                 }
             staging_task_id = task_id
@@ -760,7 +837,7 @@ def process_message_async(from_user, content):
                 from_user,
                 f"📦 已提交到中转目录\n"
                 f"📦 magnet 数量: {mag_success}{extra}\n"
-                f"🤖 中转路径: {staging_path}\n"
+                f"🤖 中转路径: {STAGING_FOLDER}\n"
                 f"⏳ 下载完成后自动清洗并转存到目标目录..."
             )
         elif magnet_urls:
@@ -871,6 +948,17 @@ def wechat_callback():
                 content = content_node.text.strip()
                 log_info(f"收到企微消息: from={from_user}, content={content[:100]}")
                 threading.Thread(target=process_message_async, args=(from_user, content)).start()
+            elif msg_type == "event":
+                event_node = tree.find("Event")
+                event_key_node = tree.find("EventKey")
+                if event_node is not None and event_key_node is not None:
+                    event = event_node.text
+                    event_key = event_key_node.text
+                    log_info(f"收到企微菜单事件: event={event}, key={event_key}, from={from_user}")
+                    if event == "click" and event_key == "status":
+                        _reply_staging_tasks(from_user)
+                else:
+                    log_warn("企微事件消息缺少 Event 或 EventKey 节点")
             else:
                 log_info(f"收到非文本消息: msg_type={msg_type}, from={from_user}")
 

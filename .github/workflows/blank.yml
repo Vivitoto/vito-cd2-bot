@@ -41,5 +41,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/vivitoto/qywx-cd2-bot:latest
-            vivitoto/qywx-cd2-bot:1.4.3
+            vivitoto/qywx-cd2-bot:1.4.4
             vivitoto/qywx-cd2-bot:latest
