@@ -40,6 +40,6 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/vivitoto/vito-cd2-bot:latest
-            vivitoto/vito-cd2-bot:1.1.1
-            vivitoto/vito-cd2-bot:latest
+            ghcr.io/vivitoto/qywx-cd2-bot:latest
+            vivitoto/qywx-cd2-bot:1.2.0
+            vivitoto/qywx-cd2-bot:latest

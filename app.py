@@ -32,8 +32,6 @@ CD2_TOKEN = os.getenv("CD2_TOKEN")
 DOWNLOAD_ROUTES_CONFIG = os.getenv("DOWNLOAD_ROUTES_CONFIG", "/config/download-routes.yml")
 DOWNLOAD_ROUTES_EXAMPLE = os.getenv("DOWNLOAD_ROUTES_EXAMPLE", "/app/download-routes.example.yml")
 
-crypto = WeChatCrypto(APP_TOKEN, ENCODING_AES_KEY, CORP_ID)
-
 # --- 内存缓存区 ---
 recent_msg_ids = []
 user_search_cache = {}
@@ -99,6 +97,12 @@ def _load_download_routes():
     if initialized:
         print(f"[*] 当前默认路由: {DEFAULT_DOWNLOAD_ROUTE}")
         print(f"[*] 可用路由: {', '.join(DOWNLOAD_ROUTES.keys())}")
+
+
+# Gunicorn 以 `app:app` 导入模块时不会执行 __main__，
+# 所以需要在模块导入阶段完成配置初始化。
+_load_download_routes()
+crypto = WeChatCrypto(APP_TOKEN, ENCODING_AES_KEY, CORP_ID)
 
 
 
@@ -424,6 +428,5 @@ def wechat_callback():
 
 
 if __name__ == "__main__":
-    _load_download_routes()
     print("[*] 机器人已启动，监听 5000 端口...")
     app.run(host="0.0.0.0", port=5000)

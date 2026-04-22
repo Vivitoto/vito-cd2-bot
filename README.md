@@ -1,4 +1,4 @@
-# 🤖 企业微信 CD2 离线下载机器人 (vito-cd2-bot)
+# 🤖 企业微信 CD2 离线下载机器人 (qywx-cd2-bot)
 
 基于 Python + Flask + gRPC 构建、使用 Gunicorn 运行的企业微信机器人。将你的企业微信打造成一个**直链 / 磁链 / ED2K 离线下载中枢**，把消息直接推送到本地的 CloudDrive2 进行离线下载。
 
@@ -30,7 +30,7 @@
 
 推荐使用 Docker Compose 进行部署。
 
-### 🛠️ 部署：vito-cd2-bot
+### 🛠️ 部署：qywx-cd2-bot
 
 #### 1. 创建 `docker-compose.yml`
 
@@ -40,9 +40,9 @@
 version: '3.8'
 
 services:
-  vito-cd2-bot:
-    image: vivitoto/vito-cd2-bot:latest
-    container_name: vito-cd2-bot
+  qywx-cd2-bot:
+    image: vivitoto/qywx-cd2-bot:latest
+    container_name: qywx-cd2-bot
     restart: unless-stopped
     ports:
       - "5110:5000"  # 左侧可以改为你想要暴露的外部端口
