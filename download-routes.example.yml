@@ -13,7 +13,7 @@ routes:
   main:
     path: /115open/磁力              # 基础目录。离线任务默认存到这里
     organize_by_date: true         # true=自动追加日期目录，如 /2026-04-22
-    allow_subdir: true             # true=允许 /main @目录名 链接 这种写法
+    allow_subdir: true             # true=允许 /main 目录名 链接；默认路由也允许 目录名 链接
     comment: 默认离线目录           # 备注说明，只给人看，程序不会用它做逻辑判断
 
   # ----------------------------------------------------------
@@ -22,7 +22,7 @@ routes:
   sub:
     path: /115open/手动转存         # 基础目录。适合手动分类转存
     organize_by_date: true         # true=自动追加日期目录，如 /2026-04-22
-    allow_subdir: true             # true=允许 /sub @目录名 链接 这种写法
+    allow_subdir: true             # true=允许 /sub 目录名 链接 这种写法
     comment: 手动转存目录           # 备注说明，只给人看，程序不会用它做逻辑判断
 
   # ----------------------------------------------------------
@@ -31,5 +31,5 @@ routes:
   temp:
     path: /115open/临时             # 基础目录。适合临时转存
     organize_by_date: false        # false=不追加日期目录
-    allow_subdir: false            # false=不允许 /temp @目录名 链接
+    allow_subdir: false            # false=不允许 /temp 目录名 链接
     comment: 临时目录，不允许自定义子目录

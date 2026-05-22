@@ -913,6 +913,31 @@ def _parse_download_command(content: str):
                         payload = "\n".join([maybe_dir, maybe_url, *rest_lines]).strip()
         else:
             return {"unknown_route": command}
+    else:
+        # 兼容默认路由下的「子目录 + 链接」写法：国产 magnet:?xt=... 或 国产\nmagnet:?xt=...
+        route_conf = _get_route_config(route)
+        if route_conf and route_conf.get("allow_subdir", True):
+            first_line, *rest_lines = text.splitlines()
+            first_parts = first_line.split(maxsplit=1)
+            if len(first_parts) == 2:
+                maybe_dir = first_parts[0].strip()
+                maybe_payload = first_parts[1].strip()
+                normalized = _normalize_download_url(maybe_payload)
+                if maybe_dir and not _is_supported_download_url(maybe_dir) and (
+                    _is_supported_download_url(maybe_payload) or normalized != maybe_payload
+                ):
+                    custom_subdir = maybe_dir
+                    payload = "\n".join([maybe_payload, *rest_lines]).strip()
+            elif len(first_parts) == 1 and rest_lines:
+                maybe_dir = first_parts[0].strip()
+                remaining_payload = "\n".join(rest_lines).strip()
+                first_payload_line = next((line.strip() for line in rest_lines if line.strip()), "")
+                normalized = _normalize_download_url(first_payload_line)
+                if maybe_dir and not _is_supported_download_url(maybe_dir) and (
+                    _is_supported_download_url(first_payload_line) or normalized != first_payload_line
+                ):
+                    custom_subdir = maybe_dir
+                    payload = remaining_payload
 
     lines = [line.strip() for line in str(payload or "").splitlines() if line.strip()]
     if not lines and payload.strip():
@@ -954,7 +979,7 @@ def process_message_async(from_user, content):
                 "⚠️ 用法示例：\n"
                 f"1. 直接离线到默认目录：E808151805F0...73FF2\n"
                 f"2. 离线到 {route_name}：/{route_name} E808151805F0...73FF2\n"
-                f"3. 离线到自定义子目录：/{route_name} @你好 E808151805F0...73FF2"
+                f"3. 离线到自定义子目录：/{route_name} 电影名 E808151805F0...73FF2"
             )
             return
 
@@ -1101,7 +1126,7 @@ def process_message_async(from_user, content):
     send_wechat_reply(
         from_user,
         "⚠️ 当前版本仅支持直接离线链接，不再提供搜索功能。\n"
-        "请发送 magnet / ed2k / http(s) / 40位hash，或使用 /路由名 + 链接。"
+        "请发送 magnet / ed2k / http(s) / 40位hash，或使用：目录名 + 链接 / /路由名 + 链接。"
     )
 
 
@@ -1117,14 +1142,18 @@ def _reply_usage_help(user_id: str):
         "E808151805F0...73FF2\n\n"
         "2. 指定路由\n"
         "/sub magnet:?xt=urn:btih:...\n\n"
-        "3. 指定子目录\n"
-        "/sub @电影名 magnet:?xt=urn:btih:...\n\n"
-        "4. 批量提交\n"
-        "/sub @电影名\n"
+        "3. 指定默认路由子目录\n"
+        "国产 magnet:?xt=urn:btih:...\n\n"
+        "4. 指定路由子目录\n"
+        "/sub 电影名 magnet:?xt=urn:btih:...\n\n"
+        "5. 批量提交\n"
+        "国产\n"
         "magnet:?xt=urn:btih:...\n"
         "ed2k://|file|xxx.mkv|123456|HASH|/\n\n"
-        "5. 查询任务\n"
-        "/tasks\n\n"
+        "6. 查询任务\n"
+        "/tasks 或 /status\n\n"
+        "7. 健康检查\n"
+        "/health 或 /check\n\n"
         f"可用路由：{routes_text}"
     )
 

@@ -15,7 +15,7 @@
 | 🛡️ 防重防抖 | 内置异步线程与消息去重机制，绕过企微 5 秒重试机制 |
 | 📅 日期归档 | 每个路由可独立决定是否自动追加 `YYYY-MM-DD` 日期目录 |
 | 🗂️ YAML 路由 | 下载目录统一由 `download-routes.yml` 管理 |
-| 🪄 自定义子目录 | 支持 `/路由名 @自定义目录 链接` 格式 |
+| 🪄 自定义子目录 | 支持 `目录名 链接`、`/路由名 目录名 链接`、多行批量等格式 |
 | 📦 批量提交 | 一条消息内多个链接统一落到同一路径 |
 | 🧹 清洗过滤 | 按后缀黑名单 + 体积阈值过滤垃圾文件 |
 | 🔄 中转清洗 | 磁力链接先下载到中转目录，完成后根据真实文件自动清洗并转存（ed2k 直接提交） |
@@ -88,7 +88,7 @@ routes:
   main:
     path: /网盘/磁力
     organize_by_date: true         # true=自动追加日期目录
-    allow_subdir: true             # true=支持 /main @自定义目录 链接
+    allow_subdir: true             # true=支持 /main 自定义目录 链接，默认路由也支持 自定义目录 链接
     comment: 默认离线目录
 
   sub:
@@ -110,7 +110,7 @@ routes:
 |---|---|
 | `path` | 基础目录，离线任务默认存到这里 |
 | `organize_by_date` | `true` 时自动追加 `YYYY-MM-DD` 日期目录 |
-| `allow_subdir` | `true` 时支持 `/路由名 @自定义目录 链接` 格式 |
+| `allow_subdir` | `true` 时支持 `目录名 链接`（默认路由）和 `/路由名 目录名 链接` 格式 |
 | `comment` | 备注，只给人看 |
 | `staging_folder`（全局） | 磁力中转清洗目录，所有路由共用；留空则不走中转 |
 
@@ -172,24 +172,40 @@ ed2k://|file|example.mkv|12345678|ABCDEF1234567890ABCDEF1234567890|/
 /sub magnet:?xt=urn:btih:YOUR_HASH_HERE
 ```
 
-### 场景 3：离线到自定义子目录
+### 场景 3：默认路由 + 自定义子目录
 
 ```
-/sub @你好 magnet:?xt=urn:btih:YOUR_HASH_HERE
+国产 magnet:?xt=urn:btih:YOUR_HASH_HERE
 ```
 
-实际路径：`/网盘/手动转存/@你好/YYYY-MM-DD`
+实际路径：`/网盘/磁力/国产/YYYY-MM-DD`
 
-### 场景 4：批量提交（多链接统一路径）
+也支持多行：
 
 ```
-/sub @你好
+国产
+magnet:?xt=urn:btih:HASH1
+ed2k://|file|example.mkv|12345678|HASH|
+```
+
+### 场景 4：指定路由 + 自定义子目录
+
+```
+/sub 你好 magnet:?xt=urn:btih:YOUR_HASH_HERE
+```
+
+实际路径：`/网盘/手动转存/你好/YYYY-MM-DD`
+
+### 场景 5：批量提交（多链接统一路径）
+
+```
+/sub 你好
 magnet:?xt=urn:btih:HASH1
 magnet:?xt=urn:btih:HASH2
 ed2k://|file|example.mkv|12345678|HASH|
 ```
 
-### 场景 5：查询未完成任务
+### 场景 6：查询未完成任务
 
 发送：
 
@@ -218,11 +234,19 @@ ed2k://|file|example.mkv|12345678|HASH|
 
 ## 📝 企微菜单
 
-容器启动时会自动尝试初始化企微应用菜单（一个"任务状态"按钮）。如果自动创建失败，你也可以手动在企微后台配置：
+容器启动时会自动尝试初始化企微应用菜单。默认包含三个按钮：
+
+| 按钮 | 事件 key | 作用 |
+|---|---|---|
+| 任务状态 | `status` | 查看未完成中转任务 |
+| 使用说明 | `help` | 显示 bot 使用说明 |
+| 健康检查 | `health` | 检查环境变量、路由配置、CD2 连接、CD2 Token、企微 API |
+
+如果自动创建失败，你也可以手动在企微后台配置：
 
 1. 企微后台 → 应用管理 → 你的应用 → 自定义菜单
 2. 添加按钮，类型选 **"点击事件"**
-3. 事件 key 填 `status`
+3. 事件 key 分别填 `status` / `help` / `health`
 4. 保存
 
 ---
