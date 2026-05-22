@@ -5,6 +5,7 @@ import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import uuid
+import time
 from typing import Optional
 
 import grpc
@@ -54,10 +55,22 @@ staging_tasks = {}
 staging_lock = threading.Lock()
 
 recent_msg_ids = []
-
-user_search_cache = {}
+recent_msg_ids_lock = threading.Lock()
 DOWNLOAD_ROUTES = {}
 DEFAULT_DOWNLOAD_ROUTE = "main"
+CD2_MOUNT_ROOT_CACHE_TTL_SECS = 60
+cd2_mount_root_cache = {"names": None, "ts": 0.0}
+cd2_mount_root_cache_lock = threading.Lock()
+
+# CD2 API 全局流控：每秒最多 2 次请求（官方上限 5 次）
+_cd2_rate_lock = threading.Lock()
+_CD2_MIN_INTERVAL = 0.5  # 2 req/s
+
+
+def _cd2_rate_limit():
+    """全局 CD2 流控：持有锁 + sleep，保证每秒至多 2 次 API 调用。"""
+    with _cd2_rate_lock:
+        time.sleep(_CD2_MIN_INTERVAL)
 
 
 def _parse_bool(val):
@@ -292,11 +305,12 @@ def _cd2_create_folder(folder_path):
             return True
         parent_path = "/".join(folder_path.split("/")[:-1]) or "/"
         folder_name = folder_path.split("/")[-1]
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.CreateFolderRequest(parentPath=parent_path, folderName=folder_name)
-        res = stub.CreateFolder(req, metadata=metadata, timeout=10)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            res = stub.CreateFolder(req, metadata=metadata, timeout=10)
         if res.result.success:
             log_info(f"CD2 目录创建成功: {folder_path}")
             return True
@@ -317,15 +331,91 @@ def _cd2_create_folder(folder_path):
         return False
 
 
+def _cd2_get_mount_root_names(force_refresh: bool = False) -> Optional[set]:
+    """读取 CD2 顶层云盘/挂载点名称，带短期缓存，避免每个任务反复扫根目录。"""
+    if not CD2_TOKEN:
+        log_warn("CD2 读取云盘根目录失败：未配置 CD2_TOKEN")
+        return None
+
+    # 缓存命中时快速返回；缓存未命中时不持锁调 CD2，避免阻塞其他读线程。
+    with cd2_mount_root_cache_lock:
+        now = time.time()
+        cached_names = cd2_mount_root_cache.get("names")
+        cached_ts = float(cd2_mount_root_cache.get("ts") or 0)
+        if not force_refresh and cached_names is not None and now - cached_ts < CD2_MOUNT_ROOT_CACHE_TTL_SECS:
+            return set(cached_names)
+
+    try:
+        metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
+        req = clouddrive_pb2.ListSubFileRequest(path="/", forceRefresh=True)
+        names = set()
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            for reply in stub.GetSubFiles(req, metadata=metadata, timeout=10):
+                for item in reply.subFiles:
+                    file_type = getattr(item, "fileType", None)
+                    is_cloud_root = bool(getattr(item, "isCloudRoot", False))
+                    is_directory = bool(getattr(item, "isDirectory", False))
+                    if file_type != clouddrive_pb2.CloudDriveFile.Directory and not (is_cloud_root or is_directory):
+                        continue
+                    name = str(getattr(item, "name", "") or "").strip().strip("/")
+                    full_path = str(getattr(item, "fullPathName", "") or "").strip().rstrip("/")
+                    if name:
+                        names.add(name)
+                    if full_path.startswith("/") and full_path.count("/") == 1:
+                        names.add(full_path.lstrip("/"))
+        with cd2_mount_root_cache_lock:
+            cd2_mount_root_cache["names"] = set(names)
+            cd2_mount_root_cache["ts"] = time.time()
+        return names
+    except Exception as e:
+        log_warn(f"CD2 读取云盘根目录失败: {e}")
+        return None
+
+
+def _cd2_mount_root_exists(root_name: str) -> bool:
+    """确认路径第一段是已存在的 CD2 云盘/挂载点，而不是需要新建的普通目录。"""
+    root_name = str(root_name or "").strip().strip("/")
+    if not root_name:
+        return True
+    mount_roots = _cd2_get_mount_root_names()
+    if mount_roots is None:
+        return False
+    if root_name in mount_roots:
+        return True
+
+    # 缓存里没找到时强制刷新一次，避免刚新增/重命名网盘后被缓存误挡。
+    fresh_roots = _cd2_get_mount_root_names(force_refresh=True)
+    if fresh_roots is None:
+        return False
+    if root_name in fresh_roots:
+        return True
+
+    log_warn(
+        f"CD2 云盘根目录不存在: /{root_name}；"
+        f"不会在其它网盘下代建该路径。当前可见根目录: {', '.join(sorted(fresh_roots)) or '空'}"
+    )
+    return False
+
+
 def _cd2_ensure_folder_recursive(folder_path: str) -> bool:
-    """按层级逐级创建目录，避免 CD2 CreateFolder 不支持递归建目录。"""
+    """按层级逐级创建目录。第一段是 CD2 云盘/挂载点，只校验存在，不尝试创建。"""
     folder_path = str(folder_path or "").strip()
     if not folder_path or folder_path == "/":
         return True
 
     parts = [p for p in folder_path.split("/") if p]
-    current = ""
-    for part in parts:
+    if not parts:
+        return True
+
+    root_name = parts[0]
+    if not _cd2_mount_root_exists(root_name):
+        log_warn(f"CD2 递归建目录失败，云盘根不存在或不可读取: /{root_name}")
+        return False
+
+    current = f"/{root_name}"
+    for part in parts[1:]:
         current = f"{current}/{part}"
         ok = _cd2_create_folder(current)
         if not ok:
@@ -335,7 +425,7 @@ def _cd2_ensure_folder_recursive(folder_path: str) -> bool:
 
 
 
-def cd2_offline_download(target_url, target_folder):
+def cd2_offline_download(target_url, target_folder, ensure_folder: bool = True):
     if not CD2_TOKEN:
         log_warn("转存失败：未配置 CD2_TOKEN")
         return False, "未配置 CD2_TOKEN"
@@ -343,15 +433,18 @@ def cd2_offline_download(target_url, target_folder):
         target_folder = (target_folder or "/").strip() or "/"
         log_info(f"开始提交离线任务，目标目录: {target_folder}")
         log_info(f"离线源: {target_url[:200]}")
-        created = _cd2_ensure_folder_recursive(target_folder)
-        if not created:
-            log_warn(f"创建目录 {target_folder} 失败，将尝试直接转存到该路径")
+        if ensure_folder:
+            created = _cd2_ensure_folder_recursive(target_folder)
+            if not created:
+                log_warn(f"目标目录不可用或创建失败，已取消转存提交: {target_folder}")
+                return False, f"目标目录不可用或创建失败: {target_folder}"
 
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.AddOfflineFileRequest(urls=target_url, toFolder=target_folder, checkFolderAfterSecs=0)
-        res = stub.AddOfflineFiles(req, metadata=metadata, timeout=10)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            res = stub.AddOfflineFiles(req, metadata=metadata, timeout=10)
         if res.success:
             log_info(f"转存提交成功: {target_folder}")
             return True, f"提交成功 → {target_folder}"
@@ -366,38 +459,42 @@ def cd2_offline_download(target_url, target_folder):
 # --- 中转清洗相关函数 ---
 
 def _cd2_list_offline_files(path: str):
-    """查询某路径下的离线任务列表。"""
+    """查询某路径下的离线任务列表。失败返回 None，避免把网络/API异常误判为空任务。"""
     if not CD2_TOKEN:
-        return []
+        log_warn("查询离线任务失败：未配置 CD2_TOKEN")
+        return None
     try:
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.FileRequest(path=path)
-        res = stub.ListOfflineFilesByPath(req, metadata=metadata, timeout=10)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            res = stub.ListOfflineFilesByPath(req, metadata=metadata, timeout=10)
         return list(res.offlineFiles)
     except Exception as e:
         log_warn(f"查询离线任务失败 {path}: {e}")
-        return []
+        return None
 
 
 def _cd2_list_directory_files(path: str):
-    """用 GetSubFiles 列出目录下的文件和子目录。"""
+    """用 GetSubFiles 列出目录下的文件和子目录。失败返回 None。"""
     if not CD2_TOKEN:
-        return []
+        log_warn("列出目录失败：未配置 CD2_TOKEN")
+        return None
     try:
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.ListSubFileRequest(path=path, forceRefresh=True)
         files = []
-        for reply in stub.GetSubFiles(req, metadata=metadata, timeout=10):
-            for f in reply.subFiles:
-                files.append(f)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            for reply in stub.GetSubFiles(req, metadata=metadata, timeout=10):
+                for f in reply.subFiles:
+                    files.append(f)
         return files
     except Exception as e:
         log_warn(f"列出目录失败 {path}: {e}")
-        return []
+        return None
 
 
 def _cd2_move_file(src_path: str, dest_folder: str):
@@ -405,15 +502,16 @@ def _cd2_move_file(src_path: str, dest_folder: str):
     if not CD2_TOKEN:
         return False
     try:
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.MoveFileRequest(
             theFilePaths=[src_path],
             destPath=dest_folder,
             conflictPolicy=clouddrive_pb2.MoveFileRequest.Overwrite
         )
-        res = stub.MoveFile(req, metadata=metadata, timeout=10)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            res = stub.MoveFile(req, metadata=metadata, timeout=10)
         if res.success:
             log_info(f"文件移动成功: {src_path} -> {dest_folder}")
             return True
@@ -429,11 +527,12 @@ def _cd2_delete_file(path: str):
     if not CD2_TOKEN:
         return False
     try:
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
         metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
         req = clouddrive_pb2.FileRequest(path=path)
-        res = stub.DeleteFile(req, metadata=metadata, timeout=10)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            res = stub.DeleteFile(req, metadata=metadata, timeout=10)
         if res.success:
             log_info(f"文件删除成功: {path}")
             return True
@@ -449,6 +548,8 @@ def _process_staging_directory(dir_path: str, target_folder: str, ext_blacklist:
     返回 (保留条目数, 垃圾文件数)。"""
     import time
     entries = _cd2_list_directory_files(dir_path)
+    if entries is None:
+        raise RuntimeError(f"列出中转目录失败: {dir_path}")
     if not entries:
         return 0, 0
 
@@ -498,6 +599,8 @@ def _process_staging_task(task: dict):
 
     # 列出中转目录下的所有条目
     entries = _cd2_list_directory_files(staging_path)
+    if entries is None:
+        raise RuntimeError(f"列出中转目录失败: {staging_path}")
     if not entries:
         log_info(f"中转目录为空: {staging_path}")
         send_wechat_reply(user_id, f"📦 中转任务完成\n目标目录: {target_folder}\n⚠️ 目录为空，无文件可处理。")
@@ -582,6 +685,9 @@ def _staging_cleanup_worker():
 
                 # 查离线任务状态
                 offline_files = _cd2_list_offline_files(staging_path)
+                if offline_files is None:
+                    log_warn(f"离线任务状态暂不可读，跳过本轮扫描: {staging_path}")
+                    continue
                 if not offline_files:
                     # 离线记录为空时，先看是否需要做目录兜底扫描（每 6 个周期一次≈30 秒，避免频繁调 CD2）
                     with staging_lock:
@@ -591,6 +697,9 @@ def _staging_cleanup_worker():
                         continue  # 非扫描周期，跳过
 
                     entries = _cd2_list_directory_files(staging_path)
+                    if entries is None:
+                        log_warn(f"中转目录暂不可读，跳过本轮兜底扫描: {staging_path}")
+                        continue
                     if not entries:
                         # 还没有离线任务记录，也没有文件，继续等待
                         with staging_lock:
@@ -629,8 +738,14 @@ def _staging_cleanup_worker():
                         f"❌ 中转任务失败\n目标目录: {task['target_folder']}\n⚠️ 有离线任务出错，请检查 CD2 后台。"
                     )
                     try:
-                        _cd2_delete_file(staging_path)
-                        log_info(f"失败中转子目录已清理: {staging_path}")
+                        if _cd2_delete_file(staging_path):
+                            entries_after_delete = _cd2_list_directory_files(staging_path)
+                            if entries_after_delete is None:
+                                log_info(f"失败中转子目录已清理或暂不可读: {staging_path}")
+                            else:
+                                log_warn(f"失败中转子目录仍可访问，可能未删除干净: {staging_path}")
+                        else:
+                            log_warn(f"失败中转子目录清理失败（非关键）: {staging_path}")
                     except Exception as e:
                         log_warn(f"失败中转子目录清理失败（非关键）: {staging_path} / {e}")
                     continue
@@ -651,8 +766,14 @@ def _staging_cleanup_worker():
                         staging_tasks[task_id]["status"] = "completed"
                     # 尝试删除已清空的中转子目录
                     try:
-                        _cd2_delete_file(staging_path)
-                        log_info(f"中转子目录已清理: {staging_path}")
+                        if _cd2_delete_file(staging_path):
+                            entries_after_delete = _cd2_list_directory_files(staging_path)
+                            if entries_after_delete is None:
+                                log_info(f"中转子目录已清理或暂不可读: {staging_path}")
+                            else:
+                                log_warn(f"中转子目录仍可访问，可能未删除干净: {staging_path}")
+                        else:
+                            log_warn(f"中转子目录清理失败（非关键）: {staging_path}")
                     except Exception as e:
                         log_warn(f"中转子目录清理失败（非关键）: {staging_path} / {e}")
                     time.sleep(1)  # 文件操作收尾
@@ -887,14 +1008,19 @@ def process_message_async(from_user, content):
             mag_fail_reasons = []
             task_subfolder = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
             staging_sub_path = _join_path(STAGING_FOLDER, task_subfolder)
-            _cd2_ensure_folder_recursive(staging_sub_path)
-            for target_url in magnet_urls:
-                success, detail = cd2_offline_download(target_url, target_folder=staging_sub_path)
-                if success:
-                    mag_success += 1
-                else:
-                    mag_fail += 1
-                    mag_fail_reasons.append(detail)
+            staging_ready = _cd2_ensure_folder_recursive(staging_sub_path)
+            if not staging_ready:
+                mag_success = 0
+                mag_fail = len(magnet_urls)
+                mag_fail_reasons.append(f"中转目录不可用或创建失败: {staging_sub_path}")
+            else:
+                for target_url in magnet_urls:
+                    success, detail = cd2_offline_download(target_url, target_folder=staging_sub_path, ensure_folder=False)
+                    if success:
+                        mag_success += 1
+                    else:
+                        mag_fail += 1
+                        mag_fail_reasons.append(detail)
 
             if mag_success == 0:
                 log_warn(f"magnet 提交全部失败: {mag_fail_reasons[0] if mag_fail_reasons else '未知错误'}")
@@ -1048,9 +1174,10 @@ def _run_health_checks() -> list[str]:
 
     # CD2 网络 / 服务检查
     try:
-        channel = grpc.insecure_channel(CD2_HOST)
-        stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
-        info = stub.GetSystemInfo(Empty(), timeout=5)
+        with grpc.insecure_channel(CD2_HOST) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            _cd2_rate_limit()
+            info = stub.GetSystemInfo(Empty(), timeout=5)
         user = getattr(info, "UserName", "") or getattr(info, "userName", "") or getattr(info, "username", "") or "已连接"
         ready = getattr(info, "SystemReady", None)
         detail = str(user) if ready is None else f"{user} / SystemReady={ready}"
@@ -1063,10 +1190,11 @@ def _run_health_checks() -> list[str]:
     # CD2 Token 授权检查（只读）
     if CD2_TOKEN:
         try:
-            channel = grpc.insecure_channel(CD2_HOST)
-            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
             metadata = [("authorization", f"Bearer {CD2_TOKEN}")]
-            stub.GetAccountStatus(Empty(), metadata=metadata, timeout=5)
+            with grpc.insecure_channel(CD2_HOST) as channel:
+                stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+                _cd2_rate_limit()
+                stub.GetAccountStatus(Empty(), metadata=metadata, timeout=5)
             lines.append(_format_check(True, "CD2 Token 授权", "可用"))
         except grpc.RpcError as e:
             lines.append(_format_check(False, "CD2 Token 授权", f"{e.code().name}: {e.details()}"))
@@ -1115,12 +1243,13 @@ def wechat_callback():
             msg_id_node = tree.find("MsgId")
             if msg_id_node is not None:
                 msg_id = msg_id_node.text
-                if msg_id in recent_msg_ids:
-                    log_info(f"消息去重跳过: msg_id={msg_id}")
-                    return "success"
-                recent_msg_ids.append(msg_id)
-                if len(recent_msg_ids) > 100:
-                    recent_msg_ids.pop(0)
+                with recent_msg_ids_lock:
+                    if msg_id in recent_msg_ids:
+                        log_info(f"消息去重跳过: msg_id={msg_id}")
+                        return "success"
+                    recent_msg_ids.append(msg_id)
+                    if len(recent_msg_ids) > 100:
+                        recent_msg_ids.pop(0)
 
             msg_type_node = tree.find("MsgType")
             if msg_type_node is None:
