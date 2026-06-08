@@ -280,6 +280,74 @@ def _get_available_routes_text() -> str:
     return "、".join(f"/{name}" for name in DOWNLOAD_ROUTES.keys())
 
 
+def _route_bool_text(value: bool, true_text: str = "开", false_text: str = "关") -> str:
+    return true_text if bool(value) else false_text
+
+
+def _short_text(value: str, max_len: int = 80) -> str:
+    value = str(value or "").strip()
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "…"
+
+
+def _format_routes_config(max_routes: int = 8) -> str:
+    """格式化当前下载路由配置，面向企微菜单查询，保持短而可读。"""
+    route_count = len(DOWNLOAD_ROUTES)
+    staging = _short_text(STAGING_FOLDER or "未启用", 60)
+    lines = [
+        "🗺️ 路由配置",
+        "━━━━━━━━━━",
+        f"默认：/{DEFAULT_DOWNLOAD_ROUTE}",
+        f"中转：{staging}",
+        f"路由：{route_count} 个",
+    ]
+
+    route_names = list(DOWNLOAD_ROUTES.keys())
+    if DEFAULT_DOWNLOAD_ROUTE in DOWNLOAD_ROUTES:
+        route_names = [DEFAULT_DOWNLOAD_ROUTE] + [name for name in route_names if name != DEFAULT_DOWNLOAD_ROUTE]
+
+    display_names = route_names[:max_routes]
+    for name in display_names:
+        conf = DOWNLOAD_ROUTES.get(name) or {}
+        lines.extend([
+            "",
+            f"/{name}" + ("  默认" if name == DEFAULT_DOWNLOAD_ROUTE else ""),
+            f"路径：{_short_text(conf.get('path') or '-', 80)}",
+            f"日期：{_route_bool_text(conf.get('organize_by_date', True))}｜子目录：{_route_bool_text(conf.get('allow_subdir', True), '允许', '禁止')}",
+        ])
+
+    if route_count > len(display_names):
+        lines.append(f"… 仅显示前 {len(display_names)} 个，共 {route_count} 个")
+
+    issues = []
+    if route_count <= 0:
+        issues.append("未配置任何路由")
+    if DEFAULT_DOWNLOAD_ROUTE not in DOWNLOAD_ROUTES:
+        issues.append(f"默认路由 /{DEFAULT_DOWNLOAD_ROUTE} 不存在")
+    bad_routes = [name for name, conf in DOWNLOAD_ROUTES.items() if not str(conf.get("path") or "").strip().startswith("/")]
+    if bad_routes:
+        issues.append("路径非绝对：" + "、".join(f"/{name}" for name in bad_routes))
+    if STAGING_FOLDER and not STAGING_FOLDER.startswith("/"):
+        issues.append("中转目录不是绝对路径")
+
+    lines.append("")
+    if issues:
+        lines.append("⚠️ 异常：")
+        lines.extend(issues[:5])
+        if len(issues) > 5:
+            lines.append(f"… 还有 {len(issues) - 5} 项")
+    else:
+        lines.append("状态：正常")
+
+    return "\n".join(lines)
+
+
+def _reply_routes_config(user_id: str):
+    """回复当前下载路由配置摘要。"""
+    send_wechat_reply(user_id, _format_routes_config())
+
+
 def _get_wechat_access_token(timeout: int = 10) -> tuple[bool, str, str]:
     """获取企微 access_token，返回 (ok, token, message)。"""
     try:
@@ -963,6 +1031,11 @@ def process_message_async(from_user, content):
         _reply_staging_tasks(from_user)
         return
 
+    # 查询路由配置
+    if content.lower() in ("/routes", "/route", "路由配置"):
+        _reply_routes_config(from_user)
+        return
+
     if content.lower() in ("/help", "help", "使用说明"):
         _reply_usage_help(from_user)
         return
@@ -1152,7 +1225,9 @@ def _reply_usage_help(user_id: str):
         "ed2k://|file|xxx.mkv|123456|HASH|/\n\n"
         "6. 查询任务\n"
         "/tasks 或 /status\n\n"
-        "7. 健康检查\n"
+        "7. 查询路由配置\n"
+        "/routes 或 /route\n\n"
+        "8. 健康检查\n"
         "/health 或 /check\n\n"
         f"可用路由：{routes_text}"
     )
@@ -1309,6 +1384,8 @@ def wechat_callback():
                     log_info(f"收到企微菜单事件: event={event}, key={event_key}, from={from_user}")
                     if event == "click" and event_key == "status":
                         _reply_staging_tasks(from_user)
+                    elif event == "click" and event_key == "routes":
+                        _reply_routes_config(from_user)
                     elif event == "click" and event_key == "help":
                         _reply_usage_help(from_user)
                     elif event == "click" and event_key == "health":
@@ -1338,9 +1415,19 @@ def init_wechat_menu():
         menu_data = {
             "button": [
                 {
-                    "type": "click",
-                    "name": "任务状态",
-                    "key": "status"
+                    "name": "查询",
+                    "sub_button": [
+                        {
+                            "type": "click",
+                            "name": "任务状态",
+                            "key": "status"
+                        },
+                        {
+                            "type": "click",
+                            "name": "路由配置",
+                            "key": "routes"
+                        }
+                    ]
                 },
                 {
                     "type": "click",
@@ -1358,7 +1445,7 @@ def init_wechat_menu():
         menu_url = f"{WECHAT_PROXY}/cgi-bin/menu/create?access_token={access_token}&agentid={AGENT_ID}"
         res = requests.post(menu_url, json=menu_data, timeout=10).json()
         if res.get("errcode") == 0:
-            log_info("企微应用菜单初始化成功：任务状态 / 使用说明 / 健康检查")
+            log_info("企微应用菜单初始化成功：查询(任务状态/路由配置) / 使用说明 / 健康检查")
         elif res.get("errcode") == 46003:
             log_info("企微应用菜单已存在，无需重复创建")
         else:
