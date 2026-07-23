@@ -1,0 +1,31 @@
+# Git and CI metadata
+.git
+.gitignore
+.github
+
+# Python/local runtime noise
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+.env
+.env.*
+*.log
+
+# Local config/data should not be baked into images
+config
+*.db
+*.sqlite
+*.sqlite3
+download-routes.yml
+
+# Editor / OS noise
+.DS_Store
+.idea
+.vscode
+*.swp
